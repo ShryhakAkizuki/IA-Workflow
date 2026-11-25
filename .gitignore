@@ -1,2 +1,13 @@
+# Variables de entorno (contienen la API key de ScribeCrate)
 .env
 .env/*
+!.env.example
+
+# Entorno virtual del proyecto
+.venv
+.venv/*
+
+# Python
+__pycache__
+__pycache__/*
+*.pyc
