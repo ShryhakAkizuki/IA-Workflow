@@ -5,6 +5,8 @@ Verifica:
      REQUERIDAS, listandolas todas en el error.
   2. Que ``STT_USE_VAD=on`` y ``STT_USE_VAD=1`` producen el mismo payload
      WS (properties tipadas, item 0.2 de PLAN_MEJORAS.md).
+  3. Que ``SILENCE_RECALIBRATE_EVERY`` se interpreta como int o None
+     (property tipada, item 1.3 de PLAN_MEJORAS.md).
 
 El ``.env`` real se oculta durante la prueba (renombrandolo) y siempre se
 restaura; nunca se borra.
@@ -119,11 +121,44 @@ def test_vad_alias_on_equals_one() -> bool:
         _drop_modules()
 
 
+def test_silence_recibrate_every() -> bool:
+    """SILENCE_RECALIBRATE_EVERY: entero -> int; vacio/ausente -> None."""
+    try:
+        _populate_env(SILENCE_RECALIBRATE_EVERY="5")
+        _reload_config()
+        cfg = sys.modules["src.config"]
+        if cfg.settings.silence_recibrate_every != 5:
+            print(
+                f"[FALLO] SILENCE_RECALIBRATE_EVERY=5 se esperaba 5: "
+                f"{cfg.settings.silence_recibrate_every!r}"
+            )
+            return False
+
+        _populate_env(SILENCE_RECALIBRATE_EVERY="")
+        _reload_config()
+        cfg = sys.modules["src.config"]
+        if cfg.settings.silence_recibrate_every is not None:
+            print(
+                "[FALLO] SILENCE_RECALIBRATE_EVERY=vacio se esperaba None: "
+                f"{cfg.settings.silence_recibrate_every!r}"
+            )
+            return False
+
+        print("[OK] SILENCE_RECALIBRATE_EVERY se interpreta como int/None.")
+        return True
+    finally:
+        _drop_modules()
+
+
 def main() -> int:
     snapshot = {k: os.environ[k] for k in ALL_KEYS if k in os.environ}
     try:
         with _env_hidden():
-            results = [test_missing_required(), test_vad_alias_on_equals_one()]
+            results = [
+                test_missing_required(),
+                test_vad_alias_on_equals_one(),
+                test_silence_recibrate_every(),
+            ]
     finally:
         _purge_env()
         os.environ.update(snapshot)

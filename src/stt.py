@@ -164,7 +164,6 @@ def _collect_segments(
 # --- Canal persistente -----
 _WS_CHUNK = 16 * 1024
 _WS_READY_TIMEOUT = 30.0
-_WS_DRAIN_QUIET = 2.0
 _WS_DRAIN_DEADLINE = 60.0
 
 def _msg_all_completed(msg: Any) -> bool:
@@ -293,17 +292,16 @@ def _ws_discard(ws: Any) -> None:
 
 def _ws_drain(ws: Any) -> tuple[Dict[float, str], List[str]]:
     """
-    Lee segmentos hasta que TODOS los segmentos lleguen "completed" y
-    sigan ``_WS_DRAIN_QUIET`` s sin mas mensajes (o deadline). El servidor
-    deja de enviar nada una vez la frase se completa.
+    Lee segmentos hasta que TODOS los segmentos lleguen "completed": los
+    eventos son acumulativos, asi que ese mensaje es definitivo y el
+    drenado se rompe de inmediato. El deadline de ``_WS_DRAIN_DEADLINE`` s
+    queda como red de seguridad por si el servidor no lo envia.
     """
     import websocket
 
     segments: Dict[float, str] = {}
     translations: List[str] = []
     ws.settimeout(2.0)
-    quiet_since = time.monotonic()
-    all_completed_at: Optional[float] = None
     deadline = time.monotonic() + _WS_DRAIN_DEADLINE
 
     while time.monotonic() < deadline:
@@ -311,22 +309,17 @@ def _ws_drain(ws: Any) -> tuple[Dict[float, str], List[str]]:
             msg = _parse_ws_msg(ws.recv())
 
         except websocket.WebSocketTimeoutException:
-
-            if all_completed_at is not None and time.monotonic() - all_completed_at > _WS_DRAIN_QUIET:
-                break
             continue
 
         except websocket.WebSocketException:
             break
-
-        quiet_since = time.monotonic()
 
         if _msg_is_ready(msg):
             continue
         _collect_segments(msg, segments, translations)
 
         if _msg_all_completed(msg):
-            all_completed_at = max(all_completed_at or quiet_since, quiet_since)
+            break
 
     return segments, translations
 

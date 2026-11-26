@@ -16,7 +16,8 @@ def _input_device():
         return override
     return sd.default.device[0]
 
-def _adaptive_threshold() -> float:
+def _measure_noise_floor() -> float:
+    """Mide ~0.6 s de la sala y deriva un umbral del ruido de fondo."""
 
     base = settings.silence_threshold
     try:
@@ -43,10 +44,39 @@ def _adaptive_threshold() -> float:
     except Exception:
         return base
 
+
+# Umbral calibrado, cacheado en modulo: por defecto se mide una sola vez
+# por proceso; con SILENCE_RECALIBRATE_EVERY=n se recalibra cada n frases.
+_cached_threshold: float | None = None
+_frases_desde_calibracion = 0
+
+
+def _adaptive_threshold() -> float:
+    """
+    Umbral de ruido calibrado con ~0.6 s de la sala, cacheado en modulo.
+
+    Por defecto se calibra UNA sola vez (primer turno); con
+    ``SILENCE_RECALIBRATE_EVERY=n`` se recalibra cada ``n`` frases
+    (``0``/ausente = nunca).
+    """
+    global _cached_threshold, _frases_desde_calibracion
+
+    if _cached_threshold is not None:
+        every = settings.silence_recibrate_every
+        _frases_desde_calibracion += 1
+        if every is None or every <= 0 or _frases_desde_calibracion < every:
+            return _cached_threshold
+
+    _cached_threshold = _measure_noise_floor()
+    _frases_desde_calibracion = 0
+    return _cached_threshold
+
+
 def record_until_silence() -> np.ndarray:
 
     threshold = _adaptive_threshold()
     voiced: list[np.ndarray] = []
+    voiced_samples = 0
     started = False
     silence_acc = 0.0
     idle_acc = 0.0
@@ -74,12 +104,13 @@ def record_until_silence() -> np.ndarray:
                 continue
 
             voiced.append(block)
+            voiced_samples += len(block)
             if energy > threshold:
                 silence_acc = 0.0
             else:
                 silence_acc += _FRAME_SECONDS
 
-            total_seconds = sum(len(b) for b in voiced) / SAMPLE_RATE
+            total_seconds = voiced_samples / SAMPLE_RATE
             if silence_acc >= settings.silence_seconds or total_seconds >= settings.max_record_seconds:
                 break
 

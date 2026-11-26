@@ -73,6 +73,7 @@ class Settings:
         "LLM_EXTRA_BODY",
         "STT_API_KEY",
         "AUDIO_INPUT_DEVICE",
+        "SILENCE_RECALIBRATE_EVERY",
     )
 
     _KNOWN: ClassVar[set[str]] = set(REQUIRED) | set(OPTIONAL)
@@ -122,6 +123,17 @@ class Settings:
     @property
     def silence_threshold(self) -> float:
         return float(self.get("SILENCE_THRESHOLD"))
+
+    @property
+    def silence_recibrate_every(self) -> int | None:
+        """Frases entre recalibraciones del umbral (None/0 = una sola vez)."""
+        value = self.get("SILENCE_RECALIBRATE_EVERY")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
 
     @property
     def silence_seconds(self) -> float:

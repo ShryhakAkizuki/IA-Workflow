@@ -16,23 +16,34 @@ client = OpenAI(
 
 _messages: list[dict] = [{"role": "system", "content": settings.get("SYSTEM_PROMPT")}]
 
+_EXTRA_BODY: dict | None = None
+
+
 def _extra_body() -> dict:
     """
     Parsea ``LLM_EXTRA_BODY`` (JSON en una variable de entorno) para mandar
     campos extra en cada request. DMR/llama.cpp usa "chat_template_kwargs".
+    El parseo se hace una sola vez por proceso (cache en modulo).
     """
+    global _EXTRA_BODY
+    if _EXTRA_BODY is not None:
+        return _EXTRA_BODY
+
     raw = (settings.get("LLM_EXTRA_BODY") or "").strip()
 
     if not raw:
-        return {}
+        _EXTRA_BODY = {}
+        return _EXTRA_BODY
 
     try:
         parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
+        _EXTRA_BODY = parsed if isinstance(parsed, dict) else {}
 
     except json.JSONDecodeError:
         print(f"[LLM] LLM_EXTRA_BODY no es JSON valido, se ignora: {raw!r}")
-        return {}
+        _EXTRA_BODY = {}
+
+    return _EXTRA_BODY
 
 def _trim_history() -> None:
     """Mantiene el system prompt y solo los ``HISTORY_TURNS`` turnos más recientes."""
