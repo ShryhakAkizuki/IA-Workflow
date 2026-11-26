@@ -29,8 +29,8 @@ def _load_dotenv() -> None:
             value = value.strip().strip('"').strip("'")
             os.environ.setdefault(key, value)
 
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[config] no se pudo leer .env: {e}", file=sys.stderr)
 
 _load_dotenv()
 
@@ -45,7 +45,6 @@ class Settings:
         # LLM - Docker Model Runner (OpenAI-compatible)
         "LLM_BASE_URL",
         "LLM_MODEL",
-        "LLM_EXTRA_BODY",
         "LLM_TEMPERATURE",
 
         # Prompt / historial
@@ -71,6 +70,7 @@ class Settings:
 
     OPTIONAL: ClassVar[tuple[str, ...]] = (
         "LLM_API_KEY",
+        "LLM_EXTRA_BODY",
         "STT_API_KEY",
         "AUDIO_INPUT_DEVICE",
     )
@@ -134,6 +134,12 @@ class Settings:
     @property
     def stt_use_vad(self) -> bool:
         return self.get("STT_USE_VAD").strip().lower() in ("1", "true", "yes", "on")
+
+    @property
+    def stt_lang(self) -> str | None:
+        """Codigo de idioma del STT; ``None`` si es autodeteccion ("auto"/vacio)."""
+        raw = (self.get("STT_LANG") or "").strip()
+        return None if raw.lower() in ("", "auto") else raw
 
     @property
     def verbose(self) -> bool:
