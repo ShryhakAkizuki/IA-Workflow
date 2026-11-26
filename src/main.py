@@ -1,11 +1,15 @@
 """Orquestador: micrófono -> ScribeCrate Live (STT) -> Docker Model Runner (LLM) -> consola.
 
+Al arrancar se precarga el LLM (DMR) y la sesion WebSocket de STT para que
+la primera frase no pague el costo de carga del modelo.
+
 Uso (desde la raiz del repo):
     python -m src.main        (Ctrl+C para salir)
 """
 import sys
 import time
 from pathlib import Path
+from threading import Thread
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,8 +18,8 @@ import sounddevice as sd
 
 from src.audio import _input_device, record_until_silence
 from src.config import settings
-from src.llm import chat_stream
-from src.stt import transcribe_audio
+from src.llm import chat_stream, llm_warmup
+from src.stt import stt_close, stt_warmup, transcribe_audio
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -55,35 +59,42 @@ def main() -> None:
     except Exception as e:
         print(f"Aviso: no se pudo listar el micro ({e})")
 
-    while True:
-        try:
-            print("\nEscuchando...")
-            audio = record_until_silence()
-            if audio is None or len(audio) == 0:
-                continue
+    print("Precargando modelos (LLM + STT)...")
+    Thread(target=llm_warmup, daemon=True).start()
+    Thread(target=stt_warmup, daemon=True).start()
 
-            t_stt_start = time.perf_counter()
-            text = transcribe_audio(audio)
-            t_stt_end = time.perf_counter()
+    try:
+        while True:
+            try:
+                print("\nEscuchando...")
+                audio = record_until_silence()
+                if audio is None or len(audio) == 0:
+                    continue
 
-            if not text:
-                print("  (sin voz reconocible)")
-                continue
-            print(f"  Tú: {text}")
+                t_stt_start = time.perf_counter()
+                text = transcribe_audio(audio)
+                t_stt_end = time.perf_counter()
 
-            ttft, total_llm = _timed_chat(text)
-            total = (t_stt_end - t_stt_start) + total_llm
-            print(
-                f"  [tiempos] STT: {t_stt_end - t_stt_start:.1f}s | "
-                f"primer token LLM: {ttft:.2f}s | "
-                f"total (STT+LLM): {total:.1f}s"
-            )
-        except KeyboardInterrupt:
-            print("\nSalida.")
-            return
-        except Exception as e:
-            print(f"  (error: {e}) — reintentando...")
-            time.sleep(1.0)
+                if not text:
+                    print("  (sin voz reconocible)")
+                    continue
+                print(f"  Tú: {text}")
+
+                ttft, total_llm = _timed_chat(text)
+                total = (t_stt_end - t_stt_start) + total_llm
+                print(
+                    f"  [tiempos] STT: {t_stt_end - t_stt_start:.1f}s | "
+                    f"primer token LLM: {ttft:.2f}s | "
+                    f"total (STT+LLM): {total:.1f}s"
+                )
+            except KeyboardInterrupt:
+                print("\nSalida.")
+                break
+            except Exception as e:
+                print(f"  (error: {e}) — reintentando...")
+                time.sleep(1.0)
+    finally:
+        stt_close()
 
 if __name__ == "__main__":
     main()

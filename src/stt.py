@@ -3,8 +3,8 @@ Cliente STT para ScribeCrate Live (hwdsl2/whisper-live-server).
 
 Soporta dos transportes, seleccionables con la variable STT_TRANSPORT:
 
-    1. "websocket" (por defecto, el preferido):
-    2. "rest" (fallback):
+    1. "websocket" (por defecto, el preferido)
+    2. "rest" (fallback)
 
 El audio se lee desde archivos WAV (16 kHz mono float32 o PCM 16-bit)
 usando la funcion local _load_wav, sin dependencias externas.
@@ -13,6 +13,7 @@ usando la funcion local _load_wav, sin dependencias externas.
 import json
 import os
 import struct
+import threading
 import time
 import urllib.parse
 import wave
@@ -160,55 +161,189 @@ def _collect_segments(
     if msg.get("type") == "translation" and "text" in msg:
         translations.append(str(msg["text"]))
 
-def _transcribe_ws(pcm_f32: bytes) -> Dict[str, Any]:
+# --- Canal persistente -----
+_WS_CHUNK = 16 * 1024
+_WS_READY_TIMEOUT = 30.0
+_WS_DRAIN_QUIET = 2.0
+_WS_DRAIN_DEADLINE = 60.0
+
+def _msg_all_completed(msg: Any) -> bool:
     """
-    Transcribe stream de audio float32 16 kHz via WebSocket de ScribeCrate.
+    True si el mensaje trae la lista de segmentos y TODOS llegan con
+    "completed": el servidor termino de procesar la frase (los eventos son
+    acumulativos, asi que el ultimo mensaje con todo "completed" es el final).
     """
+    if not isinstance(msg, dict):
+        return False
+
+    events = msg.get("segments")
+
+    if not isinstance(events, list) or not events:
+        return False
+
+    return all(isinstance(s, dict) and s.get("completed") for s in events)
+
+_ws_standby: Optional[Any] = None
+_ws_lock = threading.Lock()
+_ws_regen_thread: Optional[threading.Thread] = None
+
+
+def _ws_config() -> Dict[str, Any]:
+    """Payload de config para ScribeCrate."""
+    return {
+        "uid": "language-orchestrator",
+        "language": config.settings.stt_lang,
+        "model": config.STT_MODEL or None,
+        "task": "transcribe",
+        "audio_format": "float32",
+        "use_vad": config.settings.stt_use_vad,
+    }
+
+
+def _ws_open_session() -> Any:
+    """Abre una conexion WebSocket nueva y espera su SERVER_READY."""
     import websocket
 
     url = _build_ws_url()
 
     if config.VERBOSE:
         host = urllib.parse.urlparse(url).netloc
-        print(f"[STT:WS] conectando a ws://{host} ...")
+        print(f"[STT:WS] abriendo sesion (ws://{host}) ...")
 
     t0 = time.monotonic()
     ws = websocket.create_connection(url, timeout=30)
+    ws.send(json.dumps(_ws_config()))
+    ws.settimeout(_WS_READY_TIMEOUT)
+
+    while True:
+        msg = _parse_ws_msg(ws.recv())
+
+        if _msg_is_ready(msg):
+            break
+
+    if config.VERBOSE:
+        print(f"[STT:WS] sesion lista en {time.monotonic() - t0:.2f}s")
+
+    return ws
+
+
+def _ws_regen() -> None:
+    """Abre una nueva sesion en segundo plano (para la proxima frase)."""
+    global _ws_regen_thread
+
+    with _ws_lock:
+
+        if _ws_standby is not None:
+            return  # ya hay sesion en standby
+
+        if _ws_regen_thread is not None and _ws_regen_thread.is_alive():
+            return  # ya hay una regeneracion en marcha
+
+        _ws_regen_thread = threading.Thread(target=_ws_regen_worker, daemon=True)
+        _ws_regen_thread.start()
+
+
+def _ws_regen_worker() -> None:
+    global _ws_standby
+
+    last_err: Optional[Exception] = None
+    for attempt, delay in ((1, 0.0), (2, 1.0), (3, 2.0), (4, 4.0)):
+        with _ws_lock:
+            if _ws_standby is not None:
+                return
+        try:
+            time.sleep(delay)
+            ws = _ws_open_session()
+        except Exception as e:
+            last_err = e
+            continue
+        with _ws_lock:
+            if _ws_standby is None:
+                _ws_standby = ws
+                if config.VERBOSE:
+                    print("[STT:WS] nueva sesion en standby")
+        return
+    print(
+        f"[STT:WS] regeneracion en segundo plano fallo tras 4 intentos ({last_err}); "
+        "se reconectara en la proxima frase"
+    )
+
+
+def _ws_take_session() -> Any:
+    """Consume la sesion standby (o abre una de forma sincrona como fallback)."""
+    global _ws_standby
+
+    with _ws_lock:
+        ws = _ws_standby
+        _ws_standby = None
+    if ws is not None:
+        return ws
+    ws = _ws_open_session()
+    _ws_regen()
+    return ws
+
+
+def _ws_discard(ws: Any) -> None:
+    """Cierra una sesion consumida (el servidor la cerraria por inactividad)."""
+    try:
+        ws.close()
+    except Exception:
+        pass
+
+
+def _ws_drain(ws: Any) -> tuple[Dict[float, str], List[str]]:
+    """
+    Lee segmentos hasta que TODOS los segmentos lleguen "completed" y
+    sigan ``_WS_DRAIN_QUIET`` s sin mas mensajes (o deadline). El servidor
+    deja de enviar nada una vez la frase se completa.
+    """
+    import websocket
 
     segments: Dict[float, str] = {}
     translations: List[str] = []
-    try:
+    ws.settimeout(2.0)
+    quiet_since = time.monotonic()
+    all_completed_at: Optional[float] = None
+    deadline = time.monotonic() + _WS_DRAIN_DEADLINE
 
-        lang = None if config.STT_LANG.lower() in ("auto", "") else config.STT_LANG
-        cfg: Dict[str, Any] = {
-            "uid": "language-orchestrator",
-            "language": lang,
-            "model": config.STT_MODEL or None,
-            "task": "transcribe",
-            "audio_format": "float32",
-            "use_vad": config.STT_USE_VAD in ("1", "true", "yes"),
-        }
-        ws.send(json.dumps(cfg))
-        if config.VERBOSE:
-            print(
-                f"[STT:WS] config enviada: model={cfg['model']}, "
-                f"lang={cfg['language']}, vad={cfg['use_vad']}"
-            )
-
-        ws.settimeout(30)
-        while True:
+    while time.monotonic() < deadline:
+        try:
             msg = _parse_ws_msg(ws.recv())
-            if _msg_is_ready(msg):
+
+        except websocket.WebSocketTimeoutException:
+
+            if all_completed_at is not None and time.monotonic() - all_completed_at > _WS_DRAIN_QUIET:
                 break
-            _collect_segments(msg, segments, translations)
-        if config.VERBOSE:
-            print(f"[STT:WS] SERVER_READY en {time.monotonic() - t0:.1f}s")
+            continue
 
-        CHUNK = 32
-        n_chunks = (len(pcm_f32) + CHUNK - 1) // CHUNK
+        except websocket.WebSocketException:
+            break
 
+        quiet_since = time.monotonic()
+
+        if _msg_is_ready(msg):
+            continue
+        _collect_segments(msg, segments, translations)
+
+        if _msg_all_completed(msg):
+            all_completed_at = max(all_completed_at or quiet_since, quiet_since)
+
+    return segments, translations
+
+
+def _transcribe_ws(pcm_f32: bytes) -> Dict[str, Any]:
+    """
+    Transcribe un stream de audio float32 16 kHz sobre una sesion ya lista
+    en SERVER_READY (standby). No se repite el handshake ni la espera de
+    ready por frase: mientras transcibe, se regenera en segundo plano la
+    sesion de la proxima frase.
+    """
+    ws = _ws_take_session()
+    t0 = time.monotonic()
+    try:
+        n_chunks = (len(pcm_f32) + _WS_CHUNK - 1) // _WS_CHUNK
         for i in range(n_chunks):
-            ws.send_binary(pcm_f32[i * CHUNK : (i + 1) * CHUNK])
+            ws.send_binary(pcm_f32[i * _WS_CHUNK : (i + 1) * _WS_CHUNK])
 
         if config.VERBOSE:
             secs = len(pcm_f32) / 4 / config.SAMPLE_RATE
@@ -218,33 +353,17 @@ def _transcribe_ws(pcm_f32: bytes) -> Dict[str, Any]:
             )
 
         tail = b"\x00\x00\x00\x00" * (config.SAMPLE_RATE // 2)
-        for i in range(0, len(tail), CHUNK):
-            ws.send_binary(tail[i : i + CHUNK])
+        for i in range(0, len(tail), _WS_CHUNK):
+            ws.send_binary(tail[i : i + _WS_CHUNK])
 
-        ws.settimeout(2.0)
-        quiet_since = time.monotonic()
-        deadline = time.monotonic() + 90.0
-
-        while time.monotonic() < deadline:
-            try:
-                msg = _parse_ws_msg(ws.recv())
-
-            except websocket.WebSocketTimeoutException:
-                if segments and time.monotonic() - quiet_since > 3.0:
-                    break
-                continue
-
-            except websocket.WebSocketException:
-                break  # el servidor cerro la conexion
-            quiet_since = time.monotonic()
-
-            if _msg_is_ready(msg):
-                continue
-            _collect_segments(msg, segments, translations)
+        segments, translations = _ws_drain(ws)
 
         total = time.monotonic() - t0
         if config.VERBOSE:
-            print(f"[STT:WS] {len(segments)} segmentos en {total:.1f}s")
+            print(
+                f"[STT:WS] {len(segments)} segmentos en {total:.1f}s "
+                "(sin handshake ni espera de ready)"
+            )
 
         return {
             "text": "".join(segments[k] for k in sorted(segments)).strip(),
@@ -254,12 +373,32 @@ def _transcribe_ws(pcm_f32: bytes) -> Dict[str, Any]:
             ],
             "transport": "websocket",
         }
-
     finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+        _ws_discard(ws)
+        _ws_regen()
+
+
+def stt_warmup() -> None:
+    """
+    Abre una sesion standby y carga el modelo para que la primera frase no
+    espere el handshake ni el SERVER_READY.
+    """
+    if config.STT_TRANSPORT == "rest":
+        return
+    _ws_regen()
+
+
+def stt_close() -> None:
+    """Cierra la sesion standby (y deja de regenerar nuevas sesions)."""
+    global _ws_standby
+
+    with _ws_lock:
+        ws = _ws_standby
+        _ws_standby = None
+    if ws is not None:
+        _ws_discard(ws)
+        if config.VERBOSE:
+            print("[STT:WS] sesion cerrada")
 
 # ---------------------------------------------------------------------------
 # Transporte REST (fallback, OpenAI-compatible)
@@ -276,7 +415,7 @@ def _transcribe_rest(pcm_f32: bytes, wav_path: str) -> Dict[str, Any]:
         timeout=300.0,
     )
 
-    lang = None if config.STT_LANG.lower() in ("auto", "") else config.STT_LANG
+    lang = config.settings.stt_lang
 
     with open(wav_path, "rb") as f:
         resp = client.audio.transcriptions.create(
